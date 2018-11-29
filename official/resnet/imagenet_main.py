@@ -19,6 +19,9 @@ from __future__ import division
 from __future__ import print_function
 
 import os
+import sys
+
+sys.path.insert(0, os.path.abspath('.'))
 
 from absl import app as absl_app
 from absl import flags
@@ -217,7 +220,7 @@ class ImagenetModel(resnet_model.Model):
 
   def __init__(self, resnet_size, data_format=None, num_classes=_NUM_CLASSES,
                resnet_version=resnet_model.DEFAULT_VERSION,
-               dtype=resnet_model.DEFAULT_DTYPE):
+               dtype=resnet_model.DEFAULT_DTYPE, sparse=False):
     """These are the parameters that work for Imagenet data.
 
     Args:
@@ -250,7 +253,8 @@ class ImagenetModel(resnet_model.Model):
         block_strides=[1, 2, 2, 2],
         resnet_version=resnet_version,
         data_format=data_format,
-        dtype=dtype
+        dtype=dtype,
+        sparse=sparse,
     )
 
 
@@ -319,7 +323,9 @@ def imagenet_model_fn(features, labels, mode, params):
       loss_scale=params['loss_scale'],
       loss_filter_fn=None,
       dtype=params['dtype'],
-      fine_tune=params['fine_tune']
+      fine_tune=params['fine_tune'],
+      sparse=params["sparse_conv"],
+      pruning_hparams=params["pruning_hparams"],
   )
 
 

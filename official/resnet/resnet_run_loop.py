@@ -32,6 +32,7 @@ import os
 from absl import flags
 import tensorflow as tf
 from tensorflow.contrib.data.python.ops import threadpool
+from tensorflow.contrib.model_pruning.python import pruning
 
 from official.resnet import resnet_model
 from official.utils.flags import core as flags_core
@@ -272,7 +273,7 @@ def resnet_model_fn(features, labels, mode, model_class,
                     resnet_size, weight_decay, learning_rate_fn, momentum,
                     data_format, resnet_version, loss_scale,
                     loss_filter_fn=None, dtype=resnet_model.DEFAULT_DTYPE,
-                    fine_tune=False):
+                    fine_tune=False, sparse=False, pruning_hparams=''):
   """Shared functionality for different resnet model_fns.
 
   Initializes the ResnetModel representing the model layers
@@ -318,7 +319,7 @@ def resnet_model_fn(features, labels, mode, model_class,
   assert features.dtype == dtype
 
   model = model_class(resnet_size, data_format, resnet_version=resnet_version,
-                      dtype=dtype)
+                      dtype=dtype, sparse=sparse)
 
   logits = model(features, mode == tf.estimator.ModeKeys.TRAIN)
 
@@ -377,6 +378,23 @@ def resnet_model_fn(features, labels, mode, model_class,
         momentum=momentum
     )
 
+    if sparse:
+      # Parse pruning hyperparameters
+      pruning_hparams = pruning.get_pruning_hparams().parse(pruning_hparams)
+
+      # Create a pruning object using the pruning hyperparameters
+      pruning_obj = pruning.Pruning(pruning_hparams, global_step=global_step)
+
+      # Use the pruning_obj to add ops to the training graph to update the masks
+      # The conditional_mask_update_op will update the masks only when the
+      # training step is in [begin_pruning_step, end_pruning_step] specified in
+      # the pruning spec proto
+      mask_update_op = pruning_obj.conditional_mask_update_op()
+
+      # Use the pruning_obj to add summaries to the graph to track the sparsity
+      # of each of the layers
+      pruning_obj.add_pruning_summaries()
+
     def _dense_grad_filter(gvs):
       """Only apply gradient updates to the final layer.
 
@@ -410,7 +428,10 @@ def resnet_model_fn(features, labels, mode, model_class,
       minimize_op = optimizer.apply_gradients(grad_vars, global_step)
 
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-    train_op = tf.group(minimize_op, update_ops)
+    if sparse:
+      train_op = tf.group(minimize_op, update_ops, mask_update_op)
+    else:
+      train_op = tf.group(minimize_op, update_ops)
   else:
     train_op = None
 
@@ -429,11 +450,12 @@ def resnet_model_fn(features, labels, mode, model_class,
   tf.summary.scalar('train_accuracy_top_5', accuracy_top_5[1])
 
   return tf.estimator.EstimatorSpec(
-      mode=mode,
-      predictions=predictions,
-      loss=loss,
-      train_op=train_op,
-      eval_metric_ops=metrics)
+    mode=mode,
+    predictions=predictions,
+    loss=loss,
+    train_op=train_op,
+    eval_metric_ops=metrics,
+  )
 
 
 def resnet_main(
@@ -470,12 +492,14 @@ def resnet_main(
   distribution_strategy = distribution_utils.get_distribution_strategy(
       flags_core.get_num_gpus(flags_obj), flags_obj.all_reduce_alg)
 
-  # Creates a `RunConfig` that checkpoints every 24 hours which essentially
+  # Creates a `RunConfig` that checkpoints every 1 hour which essentially
   # results in checkpoints determined only by `epochs_between_evals`.
   run_config = tf.estimator.RunConfig(
       train_distribute=distribution_strategy,
       session_config=session_config,
-      save_checkpoints_secs=60*60*24)
+      save_checkpoints_secs=60*60,
+      keep_checkpoint_max=30,
+      )
 
   # Initializes model with all but the dense layer from pretrained ResNet.
   if flags_obj.pretrained_model_checkpoint_path is not None:
@@ -494,7 +518,9 @@ def resnet_main(
           'resnet_version': int(flags_obj.resnet_version),
           'loss_scale': flags_core.get_loss_scale(flags_obj),
           'dtype': flags_core.get_tf_dtype(flags_obj),
-          'fine_tune': flags_obj.fine_tune
+          'fine_tune': flags_obj.fine_tune,
+          "sparse_conv": flags_obj.sparse_conv,
+          "pruning_hparams": flags_obj.pruning_hparams,
       })
 
   run_params = {
@@ -504,6 +530,7 @@ def resnet_main(
       'resnet_version': flags_obj.resnet_version,
       'synthetic_data': flags_obj.use_synthetic_data,
       'train_epochs': flags_obj.train_epochs,
+      "sparse_conv": flags_obj.sparse_conv,
   }
   if flags_obj.use_synthetic_data:
     dataset_name = dataset_name + '-synthetic'
@@ -628,6 +655,13 @@ def define_resnet_flags(resnet_size_choices=None):
           'the expense of image resize/cropping being done as part of model '
           'inference. Note, this flag only applies to ImageNet and cannot '
           'be used for CIFAR.'))
+
+  flags.DEFINE_boolean(
+      name="sparse_conv", short_name="sparse", default=False,
+      help=flags_core.help_wrap('Prune 3x3 convolution layers.'))
+  flags.DEFINE_string(
+      name='pruning_hparams', default='', help=flags_core.help_wrap(
+        "Comma separated list of pruning-related hyperparameters"))
 
   choice_kwargs = dict(
       name='resnet_size', short_name='rs', default='50',
